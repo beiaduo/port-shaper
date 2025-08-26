@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -136,7 +135,7 @@ func requireBearer(next http.Handler) http.Handler {
 }
 
 // ---- Handlers ----
-// 仅实现上行限速（egress）。下行在容器里多为 policing，裸机可用 IFB 重定向（已在前面讨论）
+// 仅实现上行限速（egress）。下行在容器里多为 policing，裸机可用 IFB 重定向（如需可扩展）
 func limitHandler(w http.ResponseWriter, r *http.Request) {
 	var req LimitRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -183,9 +182,7 @@ func limitHandler(w http.ResponseWriter, r *http.Request) {
 
 	downMode := ""
 	if req.Down != "" {
-		// 在容器环境通常不能用 IFB，只能退化为 policing（示例留痕）
-		downMode = "police"
-		// 这里可以按需接 IFB 方案：ensureIFB()+在 ifb 上建 HTB class + filter
+		downMode = "police" // 容器内多数场景仅能 police；裸机可扩展 IFB
 	}
 
 	stateMu.Lock()
@@ -347,16 +344,21 @@ func getLimitHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------- Info / 菜单 ----------
+// ---------- Info ----------
+func maskToken(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:4] + "..." + s[len(s)-4:]
+}
+
 func getDefaultIPv4() string {
-	// 取默认出网 IP（不走外网调用，尽量快）
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err == nil {
 		defer conn.Close()
 		localAddr := conn.LocalAddr().(*net.UDPAddr)
 		return localAddr.IP.String()
 	}
-	// 兜底：取第一个非回环 IPv4
 	ifaces, _ := net.Interfaces()
 	for _, inf := range ifaces {
 		addrs, _ := inf.Addrs()
@@ -370,7 +372,6 @@ func getDefaultIPv4() string {
 }
 
 func getPublicIP() string {
-	// 尝试通过外部服务获取公网 IP（可失败）
 	out, err := exec.Command("sh", "-c", "curl -fsS ifconfig.me || curl -fsS api.ipify.org || true").Output()
 	if err == nil {
 		return strings.TrimSpace(string(out))
@@ -378,41 +379,33 @@ func getPublicIP() string {
 	return ""
 }
 
-func printInfo() {
+func buildURL(host string) string {
+	return fmt.Sprintf("http://%s:%s/%s", host, httpPort, strings.TrimPrefix(suffix, "/"))
+}
+
+func printInfo(showFullToken bool) {
 	localIP := getDefaultIPv4()
 	publicIP := getPublicIP()
 	if publicIP == "" {
 		publicIP = localIP
 	}
-	url := fmt.Sprintf("http://%s:%s/%s", publicIP, httpPort, strings.TrimPrefix(suffix, "/"))
-	fmt.Println("========== Port-Shaper 默认信息 ==========")
-	fmt.Printf("本机默认出网 IP:  %s\n", localIP)
-	fmt.Printf("推测公网 IP:     %s\n", publicIP)
-	fmt.Printf("监听端口:       %s\n", httpPort)
-	fmt.Printf("随机后缀:       %s\n", suffix)
-	fmt.Printf("访问 URL:       %s\n", url)
-	fmt.Println("========================================")
-}
 
-func menu() {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Println()
-		fmt.Println("Port-Shaper 菜单：")
-		fmt.Println("  [1] 查看默认信息（IP / 端口 / 后缀 / URL）")
-		fmt.Println("  [q] 退出")
-		fmt.Print("请选择：")
-		in, _ := reader.ReadString('\n')
-		in = strings.TrimSpace(in)
-		switch in {
-		case "1":
-			printInfo()
-		case "q", "Q", "quit", "exit":
-			return
-		default:
-			fmt.Println("无效选项")
-		}
+	tokenShown := apiToken
+	if !showFullToken {
+		tokenShown = maskToken(apiToken)
 	}
+
+	fmt.Println("========== Port-Shaper 信息 ==========")
+	fmt.Printf("默认出网 IP : %s\n", localIP)
+	fmt.Printf("推测公网 IP : %s\n", publicIP)
+	fmt.Printf("监听端口   : %s\n", httpPort)
+	fmt.Printf("随机后缀   : %s\n", suffix)
+	fmt.Printf("API Token : %s\n", tokenShown)
+	fmt.Printf("健康检查   : %s\n", buildURL(publicIP))
+	fmt.Println("--------------------------------------")
+	fmt.Println("调用示例（带 Bearer 头）：")
+	fmt.Printf("curl -H 'Authorization: Bearer %s' %s/limits\n", apiToken, buildURL(publicIP))
+	fmt.Println("======================================")
 }
 
 // ---- main ----
@@ -433,24 +426,28 @@ func main() {
 	}
 
 	args := os.Args[1:]
+
+	// 无参数 或 显式 info：打印信息并退出（不进入菜单）
 	if len(args) == 0 || args[0] == "info" {
-		printInfo()
-		if fi, _ := os.Stdin.Stat(); (fi.Mode() & os.ModeCharDevice) != 0 {
-			menu()
+		showFull := false
+		if len(args) >= 2 && args[1] == "--show-token" {
+			showFull = true
 		}
+		printInfo(showFull)
 		return
 	}
 
+	// 服务模式
 	if args[0] == "serve" {
 		ensureBase(devName)
 
 		r := mux.NewRouter()
 
-		// ✅ 把 API 都挂在 /{suffix} 前缀下面
+		// 所有 API 都挂在 /{suffix} 下
 		api := r.PathPrefix("/" + suffix).Subrouter()
 		api.Use(requireBearer)
 
-		// 可选：健康检查
+		// 健康检查
 		api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"success":true,"message":"ok"}`))
@@ -467,8 +464,10 @@ func main() {
 		return
 	}
 
+	// 其余参数：帮助
 	fmt.Println("用法：")
-	fmt.Println("  port-shaper            # 显示信息/菜单")
-	fmt.Println("  port-shaper info       # 仅打印信息")
-	fmt.Println("  port-shaper serve      # 作为服务监听 API")
+	fmt.Println("  port-shaper                 # 打印默认信息并退出")
+	fmt.Println("  port-shaper info            # 同上")
+	fmt.Println("  port-shaper info --show-token  # 打印完整 Token")
+	fmt.Println("  port-shaper serve           # 启动 HTTP API 服务")
 }
