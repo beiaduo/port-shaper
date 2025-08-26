@@ -147,6 +147,13 @@ write_cli() {
 set -euo pipefail
 ENV="/etc/port-shaper/env"
 [[ -f "$ENV" ]] || { echo "env file not found: $ENV"; exit 1; }
+
+# ---- 封装一次读取 env ----
+source_env() {
+  # shellcheck disable=SC1090
+  source "$ENV"
+}
+
 # shellcheck disable=SC1090
 source "$ENV"
 
@@ -170,12 +177,32 @@ show_info(){
   echo "============================================="
 }
 
+
 change_dev(){
   read -rp "请输入新的网卡名(当前: ${DEV}): " newdev
   [[ -z "${newdev}" ]] && { echo "未修改"; return; }
+
+  # 1) 校验网卡是否存在
+  if ! ip link show "$newdev" >/dev/null 2>&1; then
+    echo "❌ 网卡 ${newdev} 不存在。可用网卡："
+    ip -o link show | awk -F': ' '{print " - "$2}'
+    return
+  fi
+
+  # 2) 写入 env
   sudo sed -i "s/^DEV=.*/DEV=${newdev}/" "$ENV"
+
+  # 3) 重启服务并重新加载 env 到当前脚本
   echo "已修改为: ${newdev}，正在重启服务..."
   sudo systemctl restart port-shaper
+
+  # 4) 重新读取配置，刷新当前 Shell 里的 DEV/PORT 等变量
+  source_env
+
+  # 5) 给个简短状态
+  systemctl is-active --quiet port-shaper \
+    && echo "✅ 服务已启动，当前 DEV=${DEV}" \
+    || (echo "⚠️ 服务未处于 active，可用 2) 查看状态/3) 看日志排查"; return)
 }
 
 do_uninstall(){
