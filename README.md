@@ -4,7 +4,7 @@ readme_content = """# Port-Shaper
 
 ---
 
-## 🚀 一条安装命令
+## 🚀 一条安装命令安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/beiaduo/port-shaper/main/install.sh | bash
