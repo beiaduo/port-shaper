@@ -217,6 +217,8 @@ do_uninstall(){
   sudo rm -f /usr/local/bin/port-shaper
   sudo systemctl daemon-reload
   echo "✅ Port-Shaper 已卸载"
+  echo "bash <(curl -fsSL https://raw.githubusercontent.com/beiaduo/port-shaper/main/install.sh)"
+
 }
 
 menu(){
