@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ================== 配置 ==================
 REPO="beiaduo/port-shaper"
 BIN_NAME="port-shaper"
 BIN_DIR="/usr/local/lib/port-shaper"
 BIN_PATH="${BIN_DIR}/${BIN_NAME}"
-CLI_PATH="/usr/local/bin/port-shaper"   # 仅菜单/查看
+CLI_PATH="/usr/local/bin/port-shaper"   # 只做查询菜单
 CONF_DIR="/etc/port-shaper"
 ENV_FILE="${CONF_DIR}/env"
 SERVICE_FILE="/etc/systemd/system/port-shaper.service"
 
 DOWN_MODE_DEFAULT="police"
-DEV_DEFAULT="eth0"
-IFB_ENABLE_DEFAULT="1"
+DEV_DEFAULT="ens3"   # 默认网卡改为 ens3
 
-# 可选：指定固定版本（tag），例如 v0.1.3；不设则装 latest
-INSTALL_VERSION="${INSTALL_VERSION:-}"
+uninstall_all() {
+  echo "Uninstalling Port-Shaper ..."
+  systemctl stop port-shaper 2>/dev/null || true
+  systemctl disable port-shaper 2>/dev/null || true
+  rm -f "${SERVICE_FILE}" 2>/dev/null || true
+  rm -rf "${CONF_DIR}" 2>/dev/null || true
+  rm -rf "${BIN_DIR}" 2>/dev/null || true
+  rm -f "${CLI_PATH}" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  echo "✅ Uninstalled."
+  exit 0
+}
 
-# 是否自动尝试开放 UFW 端口（1=是，0=否）
-OPEN_UFW="${OPEN_UFW:-0}"
+if [[ "${1:-}" == "--uninstall" ]]; then
+  uninstall_all
+fi
 
-# ================== 工具函数 ==================
 detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64)  echo "amd64" ;;
@@ -30,29 +38,9 @@ detect_arch() {
   esac
 }
 
-random_port() {
-  if command -v shuf >/dev/null 2>&1; then
-    shuf -i 20000-60000 -n 1
-  else
-    awk -v min=20000 -v max=60000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}'
-  fi
-}
-
-random_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 32 | sha256sum | awk '{print $1}'
-  else
-    date +%s%N | sha256sum | awk '{print $1}'
-  fi
-}
-
-random_suffix() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 12 | tr '+/' '-_' | tr -d '='
-  else
-    date +%s%N | md5sum | cut -c1-16
-  fi
-}
+random_port() { command -v shuf >/dev/null 2>&1 && shuf -i 20000-60000 -n 1 || awk -v min=20000 -v max=60000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}'; }
+random_token() { command -v openssl >/dev/null 2>&1 && openssl rand -hex 32 | sha256sum | awk '{print $1}' || date +%s%N | sha256sum | awk '{print $1}'; }
+random_suffix() { command -v openssl >/dev/null 2>&1 && openssl rand -base64 12 | tr '+/' '-_' | tr -d '=' || date +%s%N | md5sum | cut -c1-16; }
 
 public_ip() {
   for cmd in \
@@ -67,68 +55,50 @@ public_ip() {
 }
 
 need_pkg() { dpkg -s "$1" >/dev/null 2>&1 || sudo apt-get install -y "$1"; }
-
 install_deps() {
-  sudo apt-get update -y
+  sudo apt-get update
   need_pkg iproute2
   need_pkg curl
   need_pkg ca-certificates
-  need_pkg dnsutils || true     # 提供 dig
-  need_pkg coreutils || true    # 提供 shuf/sha256sum
-}
-
-dl_url_for() {
-  local arch="$1" file=""
-  case "$arch" in
-    amd64) file="${BIN_NAME}-linux-amd64" ;;
-    arm64) file="${BIN_NAME}-linux-arm64" ;;
-  esac
-  if [[ -n "${INSTALL_VERSION}" ]]; then
-    echo "https://github.com/${REPO}/releases/download/${INSTALL_VERSION}/${file}"
-  else
-    echo "https://github.com/${REPO}/releases/latest/download/${file}"
-  fi
+  need_pkg dnsutils || true
+  need_pkg coreutils || true    # 提供 shuf
 }
 
 download_binary() {
-  local arch="$1" url tmp
-  url="$(dl_url_for "$arch")"
+  local arch="$1" url bin_file tmp
+  case "$arch" in
+    amd64) bin_file="${BIN_NAME}-linux-amd64" ;;
+    arm64) bin_file="${BIN_NAME}-linux-arm64" ;;
+  esac
+  url="https://github.com/${REPO}/releases/latest/download/${bin_file}"
   tmp="$(mktemp -d)"
-  echo "Downloading: ${url}"
-  if ! curl -fL --retry 3 --connect-timeout 8 -o "${tmp}/${BIN_NAME}" "$url"; then
-    echo "Download failed. If this is a new release, set INSTALL_VERSION=vX.Y.Z and retry." >&2
-    exit 1
-  fi
+  echo "Downloading ${url} ..."
+  curl -fL --retry 3 --connect-timeout 5 -o "${tmp}/${BIN_NAME}" "$url"
   sudo install -d -m 0755 "${BIN_DIR}"
   sudo install -m 0755 "${tmp}/${BIN_NAME}" "${BIN_PATH}"
   rm -rf "$tmp"
 }
 
-# 迁移旧 env（BASE_PATH -> SUFFIX），不存在就新建
+# 迁移旧 env（BASE_PATH -> SUFFIX），并生成缺失项
 write_env() {
   local port token suffix
-  sudo install -d -m 0755 "${CONF_DIR}"
-
   port="$(random_port)"
   token="$(random_token)"
   suffix="$(random_suffix)"
+  sudo install -d -m 0755 "${CONF_DIR}"
 
   if [[ -f "${ENV_FILE}" ]]; then
     sudo cp "${ENV_FILE}" "${ENV_FILE}.bak.$(date +%s)" || true
-
-    # BASE_PATH 迁移成 SUFFIX（去掉前导 /）
     if grep -qE '^BASE_PATH=' "${ENV_FILE}"; then
       old=$(grep -E '^BASE_PATH=' "${ENV_FILE}" | head -1 | cut -d= -f2- | sed 's#^/##')
       sudo sed -i 's/^BASE_PATH=.*/SUFFIX='"${old}"'/' "${ENV_FILE}"
     fi
-
-    # 确保关键项存在
     grep -qE '^SUFFIX='     "${ENV_FILE}" || echo "SUFFIX=${suffix}"             | sudo tee -a "${ENV_FILE}" >/dev/null
     grep -qE '^PORT='       "${ENV_FILE}" || echo "PORT=${port}"                 | sudo tee -a "${ENV_FILE}" >/dev/null
     grep -qE '^API_TOKEN='  "${ENV_FILE}" || echo "API_TOKEN=${token}"           | sudo tee -a "${ENV_FILE}" >/dev/null
     grep -qE '^DEV='        "${ENV_FILE}" || echo "DEV=${DEV_DEFAULT}"           | sudo tee -a "${ENV_FILE}" >/dev/null
     grep -qE '^DOWN_MODE='  "${ENV_FILE}" || echo "DOWN_MODE=${DOWN_MODE_DEFAULT}" | sudo tee -a "${ENV_FILE}" >/dev/null
-    grep -qE '^IFB_ENABLE=' "${ENV_FILE}" || echo "IFB_ENABLE=${IFB_ENABLE_DEFAULT}" | sudo tee -a "${ENV_FILE}" >/dev/null
+    grep -qE '^IFB_ENABLE=' "${ENV_FILE}" || echo "IFB_ENABLE=1"                 | sudo tee -a "${ENV_FILE}" >/dev/null
   else
     sudo tee "${ENV_FILE}" >/dev/null <<EOF
 # Auto-generated by install.sh
@@ -137,11 +107,9 @@ PORT=${port}
 DEV=${DEV_DEFAULT}
 SUFFIX=${suffix}
 DOWN_MODE=${DOWN_MODE_DEFAULT}
-IFB_ENABLE=${IFB_ENABLE_DEFAULT}
+IFB_ENABLE=1
 EOF
   fi
-
-  # 清理陈旧键
   sudo sed -i '/^BASE_PATH=/d' "${ENV_FILE}"
   sudo chmod 600 "${ENV_FILE}"
 }
@@ -202,15 +170,46 @@ show_info(){
   echo "============================================="
 }
 
+change_dev(){
+  read -rp "请输入新的网卡名(当前: ${DEV}): " newdev
+  [[ -z "${newdev}" ]] && { echo "未修改"; return; }
+  sudo sed -i "s/^DEV=.*/DEV=${newdev}/" "$ENV"
+  echo "已修改为: ${newdev}，正在重启服务..."
+  sudo systemctl restart port-shaper
+}
+
+do_uninstall(){
+  echo "确认卸载 Port-Shaper? [y/N]"
+  read -r ans
+  [[ "${ans,,}" != "y" ]] && { echo "已取消"; return; }
+  sudo systemctl stop port-shaper || true
+  sudo systemctl disable port-shaper || true
+  sudo rm -f /etc/systemd/system/port-shaper.service
+  sudo rm -rf /etc/port-shaper
+  sudo rm -rf /usr/local/lib/port-shaper
+  sudo rm -f /usr/local/bin/port-shaper
+  sudo systemctl daemon-reload
+  echo "✅ Port-Shaper 已卸载"
+}
+
 menu(){
   while true; do
-    echo; echo " 1) 查看访问信息"; echo " 2) 查看 systemd 状态"; echo " 3) 查看最近日志"; echo " 4) 重启服务"; echo " 0) 退出"
+    echo
+    echo " 1) 查看访问信息"
+    echo " 2) 查看 systemd 状态"
+    echo " 3) 查看最近日志"
+    echo " 4) 重启服务"
+    echo " 5) 修改网卡 (当前: ${DEV})"
+    echo " 6) 卸载 Port-Shaper"
+    echo " 0) 退出"
     read -rp "请选择: " c
     case "$c" in
       1) show_info ;;
       2) systemctl status port-shaper --no-pager ;;
       3) journalctl -u port-shaper -n 100 --no-pager ;;
       4) systemctl restart port-shaper && echo "已重启" ;;
+      5) change_dev ;;
+      6) do_uninstall; exit 0 ;;
       0) exit 0 ;;
       *) echo "无效选择" ;;
     esac
@@ -222,54 +221,13 @@ EOF
   sudo chmod +x "${CLI_PATH}"
 }
 
-open_ufw_port() {
-  if [[ "${OPEN_UFW}" != "1" ]]; then return; fi
-  if command -v ufw >/dev/null 2>&1; then
-    # shellcheck disable=SC1091
-    source "${ENV_FILE}"
-    sudo ufw allow "${PORT}/tcp" || true
-  fi
-}
-
 start_service() {
   sudo systemctl restart port-shaper
   sleep 1
   sudo systemctl --no-pager --full status port-shaper || true
 }
 
-health_check() {
-  # shellcheck disable=SC1091
-  source "${ENV_FILE}"
-  local URL="http://127.0.0.1:${PORT}/${SUFFIX}/health"
-  echo "Probing: ${URL}"
-  if ! out=$(curl -fsS -H "Authorization: Bearer ${API_TOKEN}" "${URL}" 2>&1 || true); then
-    echo "Health check failed (service可能仍在启动，或防火墙未放行)。稍后可再试：" >&2
-    echo "  curl -H 'Authorization: Bearer ${API_TOKEN}' ${URL}" >&2
-  else
-    echo "Health check OK: ${out}"
-  fi
-}
-
-uninstall_all() {
-  echo "Uninstalling port-shaper..."
-  sudo systemctl stop port-shaper || true
-  sudo systemctl disable port-shaper || true
-  sudo rm -f "${SERVICE_FILE}"
-  sudo systemctl daemon-reload
-  sudo rm -f "${CLI_PATH}"
-  sudo rm -rf "${BIN_DIR}"
-  # 如需保留配置，注释掉下一行
-  sudo rm -rf "${CONF_DIR}"
-  echo "Done."
-}
-
-# ================== 主流程 ==================
 main() {
-  if [[ "${1:-}" == "--uninstall" ]]; then
-    uninstall_all
-    exit 0
-  fi
-
   install_deps
   ARCH="$(detect_arch)"
   PUBIP="$(public_ip)"
@@ -279,10 +237,7 @@ main() {
   write_service
   start_service
   write_cli
-  open_ufw_port
-  health_check
 
-  # 展示安装摘要
   # shellcheck disable=SC1091
   source "${ENV_FILE}"
   echo
@@ -301,7 +256,6 @@ main() {
   echo "---------------------------------------"
   echo "查看信息/菜单： port-shaper"
   echo "非交互输出：   port-shaper ${PUBIP}"
-  echo "指定版本安装： INSTALL_VERSION=v0.1.3 bash install.sh"
   echo "卸载：         bash install.sh --uninstall"
   echo "======================================="
 }
