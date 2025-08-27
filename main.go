@@ -102,16 +102,35 @@ func ensureBase(dev string) {
 		"htb", "rate", "10gbit", "ceil", "10gbit")
 }
 
+// 替换原 ensureIngress
 func ensureIngress(dev string) error {
-	err := runTc("qdisc", "add", "dev", dev, "ingress")
-	if err != nil {
-		s := strings.ToLower(err.Error())
-		if strings.Contains(s, "file exists") || strings.Contains(s, "exists") {
-			return nil
+	// 先尝试 add
+	if err := runTc("qdisc", "add", "dev", dev, "ingress"); err != nil {
+		es := strings.ToLower(err.Error())
+		// 已存在或被独占，都当“可能已就绪”处理
+		if strings.Contains(es, "file exists") || strings.Contains(es, "exists") ||
+			strings.Contains(es, "exclusivity flag on") {
+			// 再确认一下当前是否真的挂着 ingress/clsact
+			out := cmdShowQdisc(dev)
+			if strings.Contains(out, "qdisc ingress ffff:") || strings.Contains(out, "qdisc clsact ffff:") {
+				return nil // 已经有 ffff:，可以直接用
+			}
+			// 看起来没有，那就强制 del 后再 add 一次
+			_ = runTc("qdisc", "del", "dev", dev, "ingress")
+			if err2 := runTc("qdisc", "add", "dev", dev, "ingress"); err2 == nil {
+				return nil
+			}
+			return fmt.Errorf("re-add ingress after del failed: %v", err)
 		}
-		return err
+		return fmt.Errorf("add ingress failed: %v", err)
 	}
 	return nil
+}
+
+// 辅助：读取 qdisc 列表
+func cmdShowQdisc(dev string) string {
+	out, _ := exec.Command("tc", "qdisc", "show", "dev", dev).CombinedOutput()
+	return strings.ToLower(string(out))
 }
 
 /*************** 速率解析（自动 +2M，输出 "<N>mbit"） ***************/
