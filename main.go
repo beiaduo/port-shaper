@@ -17,19 +17,23 @@ import (
 )
 
 /*
-  Port-Shaper (IPv4 only, Up=egress HTB, Down=ingress police)
-  - 速率字段支持: "60", "60m", "60mbit", "60000kbit" 等，统一解析为 Mbps，并自动 +2 Mbps 再下发为 "<N>mbit"
-  - Up: 在 root 1: 下创建 class(1:<hex(port)>)，并添加 TCP/UDP 的 u32 过滤器（sport/dport 双向匹配）
-  - Down: 在 ingress(ffff:) 下添加 police（TCP/UDP 各一条，匹配 dport）
-  - 每个端口的过滤器使用“按端口派生的 prio”，便于精准删除
+  Port-Shaper (Debian / IPv4)
+  - Up：root 1: 下 HTB class(1:<hex(port)>)，配 TCP/UDP 的 u32 过滤器（sport+dport）
+  - Down：ingress(ffff:) 下 TCP/UDP dport 的 police
+  - 速率：支持 "60" / "60m" / "60mbit" / "60000kbit"；统一解析为 Mbps 并自动 +2Mbps 下发 "<N>mbit"
+  - 健壮性：
+      * 确保 HTB 根(1:) 存在；确保 ingress 存在（兼容 exclusivity/exists）
+      * 变更前先删旧 prio 的过滤器，再重建（避免多条叠加导致旧值生效）
+      * Down 为空时默认跟随 Up，避免只改上行但下行仍卡旧 police
 */
 
+// -------- 数据结构 --------
 type LimitRequest struct {
 	OID  string `json:"oid"`
 	Dev  string `json:"dev"`
 	Port int    `json:"port"`
-	Up   string `json:"up,omitempty"`   // 可传 "60"
-	Down string `json:"down,omitempty"` // 可传 "60"
+	Up   string `json:"up,omitempty"`   // 传 "60" 即可
+	Down string `json:"down,omitempty"` // 可省略：默认跟随 Up
 }
 
 type APIResponse struct {
@@ -39,8 +43,8 @@ type APIResponse struct {
 	OID      string `json:"oid"`
 	Dev      string `json:"dev"`
 	Port     int    `json:"port"`
-	Up       string `json:"up,omitempty"`   // 实际下发的速率（已 +2，附单位）
-	Down     string `json:"down,omitempty"` // 实际下发的速率（已 +2，附单位）
+	Up       string `json:"up,omitempty"`   // 实际下发（含 +2 与单位）
+	Down     string `json:"down,omitempty"` // 实际下发（含 +2 与单位）
 	ClassID  string `json:"classid,omitempty"`
 	DownMode string `json:"down_mode,omitempty"`
 }
@@ -50,6 +54,7 @@ type ClearAllRequest struct {
 	Dev string `json:"dev"`
 }
 
+// -------- 运行时状态 --------
 var (
 	apiToken = "changeme"
 	devName  = "eth0"
@@ -57,10 +62,10 @@ var (
 	suffix   = "" // 路由前缀
 
 	stateMu sync.RWMutex
-	state   = map[int]LimitRequest{} // 仅做展示
+	state   = map[int]LimitRequest{} // 仅展示用途
 )
 
-/*************** 工具 ***************/
+// -------- 通用工具 --------
 func writeJSON(w http.ResponseWriter, code int, resp APIResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -80,9 +85,7 @@ func runTc(args ...string) error {
 	return nil
 }
 
-func classIDFromPort(port int) string {
-	return fmt.Sprintf("1:%x", port)
-}
+func classIDFromPort(port int) string { return fmt.Sprintf("1:%x", port) }
 
 func isNotFoundErr(err error) bool {
 	if err == nil {
@@ -95,6 +98,7 @@ func isNotFoundErr(err error) bool {
 		strings.Contains(s, "invalid handle")
 }
 
+// 启动时初始化：重置 root 并建默认大口子（会清空既有 root 规则）
 func ensureBase(dev string) {
 	_ = runTc("qdisc", "del", "dev", dev, "root")
 	_ = runTc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "999")
@@ -102,20 +106,32 @@ func ensureBase(dev string) {
 		"htb", "rate", "10gbit", "ceil", "10gbit")
 }
 
-// 替换原 ensureIngress
+// 确保 HTB 根存在（存在则不动；不存在则创建 1: 与 1:999）
+func ensureHTBRoot(dev string) error {
+	out, _ := exec.Command("tc", "qdisc", "show", "dev", dev).CombinedOutput()
+	low := strings.ToLower(string(out))
+	if strings.Contains(low, "qdisc htb 1:") {
+		return nil
+	}
+	_ = runTc("qdisc", "del", "dev", dev, "root")
+	if err := runTc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "999"); err != nil {
+		return err
+	}
+	return runTc("class", "add", "dev", dev, "parent", "1:", "classid", "1:999",
+		"htb", "rate", "10gbit", "ceil", "10gbit")
+}
+
+// 确保 ingress 存在；兼容 exclusivity/exists；必要时先删再加
 func ensureIngress(dev string) error {
-	// 先尝试 add
 	if err := runTc("qdisc", "add", "dev", dev, "ingress"); err != nil {
 		es := strings.ToLower(err.Error())
-		// 已存在或被独占，都当“可能已就绪”处理
 		if strings.Contains(es, "file exists") || strings.Contains(es, "exists") ||
 			strings.Contains(es, "exclusivity flag on") {
-			// 再确认一下当前是否真的挂着 ingress/clsact
-			out := cmdShowQdisc(dev)
-			if strings.Contains(out, "qdisc ingress ffff:") || strings.Contains(out, "qdisc clsact ffff:") {
-				return nil // 已经有 ffff:，可以直接用
+			out, _ := exec.Command("tc", "qdisc", "show", "dev", dev).CombinedOutput()
+			low := strings.ToLower(string(out))
+			if strings.Contains(low, "qdisc ingress ffff:") || strings.Contains(low, "qdisc clsact ffff:") {
+				return nil // 已有 ffff: 可用
 			}
-			// 看起来没有，那就强制 del 后再 add 一次
 			_ = runTc("qdisc", "del", "dev", dev, "ingress")
 			if err2 := runTc("qdisc", "add", "dev", dev, "ingress"); err2 == nil {
 				return nil
@@ -127,20 +143,12 @@ func ensureIngress(dev string) error {
 	return nil
 }
 
-// 辅助：读取 qdisc 列表
-func cmdShowQdisc(dev string) string {
-	out, _ := exec.Command("tc", "qdisc", "show", "dev", dev).CombinedOutput()
-	return strings.ToLower(string(out))
-}
-
-/*************** 速率解析（自动 +2M，输出 "<N>mbit"） ***************/
+// -------- 速率解析（自动 +2Mbps，输出 "<N>mbit"） --------
 func normalizeRateMbpsPlus2(in string) (string, error) {
 	s := strings.TrimSpace(strings.ToLower(in))
 	if s == "" {
 		return "", errors.New("empty rate")
 	}
-	// 允许纯数字或带单位
-	// 优先判断 kbit/mbit
 	if strings.HasSuffix(s, "kbit") {
 		num := strings.TrimSuffix(s, "kbit")
 		kb, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
@@ -148,7 +156,7 @@ func normalizeRateMbpsPlus2(in string) (string, error) {
 			return "", fmt.Errorf("invalid kbit: %v", err)
 		}
 		mb := kb / 1000.0
-		mb += 2 // +2Mbps
+		mb += 2
 		return fmt.Sprintf("%.0fmbit", mb), nil
 	}
 	if strings.HasSuffix(s, "mbit") || strings.HasSuffix(s, "m") {
@@ -160,7 +168,6 @@ func normalizeRateMbpsPlus2(in string) (string, error) {
 		mb += 2
 		return fmt.Sprintf("%.0fmbit", mb), nil
 	}
-	// 纯数字，按 Mbps 处理
 	if v, err := strconv.ParseFloat(s, 64); err == nil {
 		v += 2
 		return fmt.Sprintf("%.0fmbit", v), nil
@@ -168,52 +175,65 @@ func normalizeRateMbpsPlus2(in string) (string, error) {
 	return "", fmt.Errorf("unrecognized rate: %s", in)
 }
 
-/*************** prio 生成（便于删除） ***************/
-func prioBaseForPort(port int) int {
-	// 生成 10000..19998 间的偶数，尽量避开常见低优先级
-	return 10000 + (port%5000)*2
-}
+// -------- prio 生成（按端口派生） --------
+func prioBaseForPort(port int) int { return 10000 + (port%5000)*2 }
 func priosForPort(port int) (egTCP, egUDP, inTCP, inUDP int) {
 	base := prioBaseForPort(port)
-	// egress TCP/UDP
-	egTCP = base
-	egUDP = base + 1
-	// ingress TCP/UDP
-	inTCP = base + 2
-	inUDP = base + 3
-	return
+	return base, base + 1, base + 2, base + 3
 }
 
-/*************** Egress: HTB + u32 (TCP/UDP, sport/dport) ***************/
+// -------- Egress: HTB + u32 (TCP/UDP, sport/dport) --------
+func removeEgressFilters(dev string, port int) {
+	egTCP, egUDP, _, _ := priosForPort(port)
+	_ = runTc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip", "prio", strconv.Itoa(egTCP))
+	_ = runTc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip", "prio", strconv.Itoa(egUDP))
+}
+
 func applyEgressHTB(dev string, port int, rateMbit string) error {
+	if err := ensureHTBRoot(dev); err != nil {
+		return fmt.Errorf("ensure htb root: %v", err)
+	}
+	// 先删旧过滤器，防止多条叠加
+	removeEgressFilters(dev, port)
+
 	classid := classIDFromPort(port)
-	// 创建/替换 class
 	if err := runTc("class", "replace", "dev", dev, "parent", "1:",
 		"classid", classid, "htb", "rate", rateMbit, "ceil", rateMbit); err != nil {
-		return err
+		// 若 parent 1: 不存在，ensure 后再试（双保险）
+		if strings.Contains(strings.ToLower(err.Error()), "no such file") {
+			if e2 := ensureHTBRoot(dev); e2 != nil {
+				return fmt.Errorf("ensure htb root retry: %v", e2)
+			}
+			if e3 := runTc("class", "replace", "dev", dev, "parent", "1:",
+				"classid", classid, "htb", "rate", rateMbit, "ceil", rateMbit); e3 != nil {
+				return e3
+			}
+		} else {
+			return err
+		}
 	}
+
 	p := strconv.Itoa(port)
 	egTCP, egUDP, _, _ := priosForPort(port)
 
-	// TCP (dport)
+	// TCP dport / sport
 	_ = runTc("filter", "replace", "dev", dev, "parent", "1:",
 		"protocol", "ip", "prio", strconv.Itoa(egTCP), "u32",
 		"match", "ip", "protocol", "6", "0xff",
 		"match", "ip", "dport", p, "0xffff",
 		"flowid", classid)
-	// TCP (sport)
 	_ = runTc("filter", "replace", "dev", dev, "parent", "1:",
 		"protocol", "ip", "prio", strconv.Itoa(egTCP), "u32",
 		"match", "ip", "protocol", "6", "0xff",
 		"match", "ip", "sport", p, "0xffff",
 		"flowid", classid)
-	// UDP (dport)
+
+	// UDP dport / sport
 	_ = runTc("filter", "replace", "dev", dev, "parent", "1:",
 		"protocol", "ip", "prio", strconv.Itoa(egUDP), "u32",
 		"match", "ip", "protocol", "17", "0xff",
 		"match", "ip", "dport", p, "0xffff",
 		"flowid", classid)
-	// UDP (sport)
 	_ = runTc("filter", "replace", "dev", dev, "parent", "1:",
 		"protocol", "ip", "prio", strconv.Itoa(egUDP), "u32",
 		"match", "ip", "protocol", "17", "0xff",
@@ -225,19 +245,18 @@ func applyEgressHTB(dev string, port int, rateMbit string) error {
 
 func removeEgressHTB(dev string, port int) {
 	classid := classIDFromPort(port)
-	egTCP, egUDP, _, _ := priosForPort(port)
-	// 删除本端口的 egress 过滤器（按 prio）
-	_ = runTc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip", "prio", strconv.Itoa(egTCP))
-	_ = runTc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip", "prio", strconv.Itoa(egUDP))
-	// 删除 class
+	removeEgressFilters(dev, port)
 	_ = runTc("class", "del", "dev", dev, "classid", classid)
 }
 
-/*************** Ingress: police (TCP/UDP, dport) ***************/
+// -------- Ingress: police (TCP/UDP, dport) --------
 func applyIngressPolice(dev string, port int, rateMbit string) error {
 	if err := ensureIngress(dev); err != nil {
 		return fmt.Errorf("ensure ingress: %v", err)
 	}
+	// 先删旧（该端口 prio）
+	removeIngressPolice(dev, port)
+
 	p := strconv.Itoa(port)
 	_, _, inTCP, inUDP := priosForPort(port)
 
@@ -246,8 +265,7 @@ func applyIngressPolice(dev string, port int, rateMbit string) error {
 		"protocol", "ip", "prio", strconv.Itoa(inTCP), "u32",
 		"match", "ip", "protocol", "6", "0xff",
 		"match", "ip", "dport", p, "0xffff",
-		"police", "rate", rateMbit, "burst", "300k", "mtu", "64kb", "drop",
-	); err != nil {
+		"police", "rate", rateMbit, "burst", "300k", "mtu", "64kb", "drop"); err != nil {
 		return err
 	}
 	// UDP
@@ -255,8 +273,7 @@ func applyIngressPolice(dev string, port int, rateMbit string) error {
 		"protocol", "ip", "prio", strconv.Itoa(inUDP), "u32",
 		"match", "ip", "protocol", "17", "0xff",
 		"match", "ip", "dport", p, "0xffff",
-		"police", "rate", rateMbit, "burst", "300k", "mtu", "64kb", "drop",
-	); err != nil {
+		"police", "rate", rateMbit, "burst", "300k", "mtu", "64kb", "drop"); err != nil {
 		return err
 	}
 	return nil
@@ -268,8 +285,7 @@ func removeIngressPolice(dev string, port int) {
 	_ = runTc("filter", "del", "dev", dev, "parent", "ffff:", "protocol", "ip", "prio", strconv.Itoa(inUDP))
 }
 
-/*************** Handlers ***************/
-// 设置限速
+// -------- Handlers --------
 func limitHandler(w http.ResponseWriter, r *http.Request) {
 	var req LimitRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -289,35 +305,40 @@ func limitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var upOut, downOut string
-	// Egress
+	// 关键：Down 为空时默认与 Up 同步，避免旧 police 残留
+	if req.Down == "" && req.Up != "" {
+		req.Down = req.Up
+	}
+
+	var upOut, downOut, downMode string
+
+	// Egress（上行）
 	if req.Up != "" {
 		norm, err := normalizeRateMbpsPlus2(req.Up)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "invalid up: " + err.Error(),
-				OID: req.OID, Dev: req.Dev, Port: req.Port, Up: req.Up, Down: req.Down, ClassID: classid})
+				OID: req.OID, Dev: req.Dev, Port: req.Port, ClassID: classid})
 			return
 		}
 		if err := applyEgressHTB(req.Dev, req.Port, norm); err != nil {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "apply up failed: " + err.Error(),
-				OID: req.OID, Dev: req.Dev, Port: req.Port, Up: req.Up, Down: req.Down, ClassID: classid})
+				OID: req.OID, Dev: req.Dev, Port: req.Port, ClassID: classid})
 			return
 		}
 		upOut = norm
 	}
 
-	downMode := ""
-	// Ingress
+	// Ingress（下行）
 	if req.Down != "" {
 		norm, err := normalizeRateMbpsPlus2(req.Down)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "invalid down: " + err.Error(),
-				OID: req.OID, Dev: req.Dev, Port: req.Port, Up: req.Up, Down: req.Down, ClassID: classid})
+				OID: req.OID, Dev: req.Dev, Port: req.Port, ClassID: classid})
 			return
 		}
 		if err := applyIngressPolice(req.Dev, req.Port, norm); err != nil {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "apply down(police) failed: " + err.Error(),
-				OID: req.OID, Dev: req.Dev, Port: req.Port, Up: req.Up, Down: req.Down, ClassID: classid})
+				OID: req.OID, Dev: req.Dev, Port: req.Port, ClassID: classid})
 			return
 		}
 		downMode = "police"
@@ -335,7 +356,6 @@ func limitHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 取消某端口限速
 func unlimitHandler(w http.ResponseWriter, r *http.Request) {
 	var req LimitRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -363,7 +383,6 @@ func unlimitHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 清空（当前设备）所有
 func clearAllHandler(w http.ResponseWriter, r *http.Request) {
 	var req ClearAllRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -372,7 +391,7 @@ func clearAllHandler(w http.ResponseWriter, r *http.Request) {
 		dev = devName
 	}
 
-	// 清 egress
+	// 清 egress/root
 	if err := resetDev(dev); err != nil && !isNotFoundErr(err) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -384,7 +403,7 @@ func clearAllHandler(w http.ResponseWriter, r *http.Request) {
 	_ = runTc("filter", "del", "dev", dev, "parent", "ffff:")
 	_ = runTc("qdisc", "del", "dev", dev, "ingress")
 
-	// 内存状态
+	// 清内存状态
 	stateMu.Lock()
 	for p := range state {
 		delete(state, p)
@@ -396,7 +415,6 @@ func clearAllHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 列表
 func listLimitsHandler(w http.ResponseWriter, r *http.Request) {
 	stateMu.RLock()
 	defer stateMu.RUnlock()
@@ -412,7 +430,6 @@ func listLimitsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 查询
 func getLimitHandler(w http.ResponseWriter, r *http.Request) {
 	portStr := mux.Vars(r)["port"]
 	port, _ := strconv.Atoi(portStr)
@@ -434,7 +451,7 @@ func getLimitHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-/*************** Info ***************/
+// -------- Info & Auth --------
 func maskToken(s string) string {
 	if len(s) <= 8 {
 		return s
@@ -473,18 +490,15 @@ func buildURL(host string) string {
 	return fmt.Sprintf("http://%s:%s/%s", host, httpPort, strings.TrimPrefix(suffix, "/"))
 }
 
-// ---- 验证中间件（通用稳健版）----
+// 更稳健的鉴权：Authorization: Bearer / X-API-Token / ?token=
 func requireBearer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := strings.TrimSpace(apiToken)
-
-		// 若未设置 API_TOKEN，则放行（如需强制校验，可改为返回 401）
 		if want == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// 1) Authorization: Bearer <token>（大小写不敏感）
 		got := ""
 		if ah := strings.TrimSpace(r.Header.Get("Authorization")); ah != "" {
 			parts := strings.Fields(ah)
@@ -492,13 +506,9 @@ func requireBearer(next http.Handler) http.Handler {
 				got = parts[1]
 			}
 		}
-
-		// 2) 兼容 X-API-Token 头
 		if got == "" {
 			got = strings.TrimSpace(r.Header.Get("X-API-Token"))
 		}
-
-		// 3) 兼容 ?token= 查询参数
 		if got == "" {
 			got = strings.TrimSpace(r.URL.Query().Get("token"))
 		}
@@ -524,26 +534,25 @@ func printInfo(showFullToken bool) {
 	if publicIP == "" {
 		publicIP = localIP
 	}
-
 	tokenShown := apiToken
 	if !showFullToken {
 		tokenShown = maskToken(apiToken)
 	}
 
-	fmt.Println("========== Port-Shaper 信息 ==========")
+	fmt.Println("========== Port-Shaper ==========")
 	fmt.Printf("默认出网 IP : %s\n", localIP)
 	fmt.Printf("推测公网 IP : %s\n", publicIP)
 	fmt.Printf("监听端口   : %s\n", httpPort)
-	fmt.Printf("随机后缀   : %s\n", suffix)
+	fmt.Printf("路由前缀   : /%s\n", suffix)
 	fmt.Printf("API Token : %s\n", tokenShown)
-	fmt.Printf("健康检查   : %s/health\n", buildURL(publicIP)) // 修正：实际路由为 /{suffix}/health
-	fmt.Println("--------------------------------------")
+	fmt.Printf("健康检查   : %s/health\n", buildURL(publicIP))
+	fmt.Println("---------------------------------")
 	fmt.Println("调用示例（带 Bearer 头）：")
 	fmt.Printf("curl -H 'Authorization: Bearer %s' %s/limits\n", apiToken, buildURL(publicIP))
-	fmt.Println("======================================")
+	fmt.Println("=================================")
 }
 
-/*************** main ***************/
+// -------- reset / main --------
 func resetDev(dev string) error {
 	if err := runTc("qdisc", "del", "dev", dev, "root"); err != nil && !isNotFoundErr(err) {
 		return fmt.Errorf("qdisc del: %v", err)
@@ -576,29 +585,29 @@ func main() {
 
 	args := os.Args[1:]
 
-	// 无参数 或 info：只打印信息
+	// 无参数 / info：只打印信息
 	if len(args) == 0 || args[0] == "info" {
-		showFull := false
-		if len(args) >= 2 && args[1] == "--show-token" {
-			showFull = true
-		}
+		showFull := len(args) >= 2 && args[1] == "--show-token"
 		printInfo(showFull)
 		return
 	}
 
 	// 服务模式
 	if args[0] == "serve" {
+		// 启动时初始化成 HTB 根（告别 fq/fq_codel 混淆）
 		ensureBase(devName)
 
 		r := mux.NewRouter()
 		api := r.PathPrefix("/" + suffix).Subrouter()
 		api.Use(requireBearer)
 
+		// 健康检查
 		api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"success":true,"message":"ok"}`))
 		}).Methods("GET")
 
+		// APIs
 		api.HandleFunc("/limit", limitHandler).Methods("POST")
 		api.HandleFunc("/unlimit", unlimitHandler).Methods("POST")
 		api.HandleFunc("/unlimit_all", clearAllHandler).Methods("POST")
@@ -610,9 +619,9 @@ func main() {
 		return
 	}
 
-	// 其余参数：帮助
+	// 其余：帮助
 	fmt.Println("用法：")
-	fmt.Println("  port-shaper                 # 打印默认信息并退出")
+	fmt.Println("  port-shaper                 # 打印信息并退出")
 	fmt.Println("  port-shaper info            # 同上")
 	fmt.Println("  port-shaper info --show-token  # 打印完整 Token")
 	fmt.Println("  port-shaper serve           # 启动 HTTP API 服务")
