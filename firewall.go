@@ -52,6 +52,20 @@ func iptExists(args ...string) bool {
 	return cmd.Run() == nil
 }
 
+func iptList(chain string) ([]string, error) {
+	cmd := exec.Command("iptables", "-S", chain)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("iptables -S %s: %s", chain, msg)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	return lines, nil
+}
+
 func ensureChain() error {
 	// 创建链（已存在忽略）
 	_ = ipt("-N", fwChain)
@@ -66,39 +80,60 @@ func ensureChain() error {
 	return nil
 }
 
-// 确保端口兜底 DROP 存在（TCP/UDP 各一条，位于链尾部）
+// 确保端口兜底 DROP 存在且位于链尾部（TCP/UDP 各一条，且去重）
 func ensurePortDrops(port int) error {
 	p := strconv.Itoa(port)
 
-	// TCP
-	if !iptExists(fwChain, "-p", "tcp", "--dport", p, "-j", "DROP") {
-		// 用 -A 追加，保证在 ACCEPT 之后
-		if err := ipt("-A", fwChain, "-p", "tcp", "--dport", p, "-j", "DROP"); err != nil {
-			return err
+	// 先删除该端口上可能存在的所有 DROP，再以 -A 方式统一追加到链尾
+	lines, err := iptList(fwChain)
+	if err != nil {
+		return err
+	}
+	for _, line := range lines {
+		// 只关心本端口的 DROP 规则
+		if strings.Contains(line, " --dport "+p+" ") && strings.Contains(line, " -j DROP") {
+			// line 形如: -A PS_TRUST -p tcp --dport 1234 -j DROP
+			// 将 -A 改成 -D 以精准删除
+			del := strings.Replace(line, "-A "+fwChain, fwChain, 1)
+			del = strings.Replace(del, "-A", "-D", 1)
+			// 构造参数并执行删除
+			args := strings.Fields(del)
+			_ = ipt(args...)
 		}
 	}
-	// UDP
-	if !iptExists(fwChain, "-p", "udp", "--dport", p, "-j", "DROP") {
-		if err := ipt("-A", fwChain, "-p", "udp", "--dport", p, "-j", "DROP"); err != nil {
-			return err
-		}
+
+	// 统一在链尾追加一次 TCP/UDP 的 DROP
+	if err := ipt("-A", fwChain, "-p", "tcp", "--dport", p, "-j", "DROP"); err != nil {
+		return err
+	}
+	if err := ipt("-A", fwChain, "-p", "udp", "--dport", p, "-j", "DROP"); err != nil {
+		return err
 	}
 	return nil
 }
 
-// 删除某端口下的所有 ACCEPT（仅清 ACCEPT，不动兜底 DROP）
+// 删除某端口下的所有 ACCEPT（基于 iptables 实况扫描），不动兜底 DROP
 func clearAcceptRules(port int) {
 	p := strconv.Itoa(port)
-	old := fwMap[port]
-	for ip := range old {
-		_ = ipt("-D", fwChain, "-p", "tcp", "-s", ip, "--dport", p, "-j", "ACCEPT")
-		_ = ipt("-D", fwChain, "-p", "udp", "-s", ip, "--dport", p, "-j", "ACCEPT")
+	lines, err := iptList(fwChain)
+	if err != nil {
+		return
+	}
+	for _, line := range lines {
+		// 只删除指定端口、动作为 ACCEPT 的规则（无论是否带 -s）
+		if strings.Contains(line, " --dport "+p+" ") && strings.Contains(line, " -j ACCEPT") {
+			// 将 -A 改成 -D 精准删除
+			del := strings.Replace(line, "-A "+fwChain, fwChain, 1)
+			del = strings.Replace(del, "-A", "-D", 1)
+			args := strings.Fields(del)
+			_ = ipt(args...)
+		}
 	}
 }
 
 // 将端口的允许来源替换为 ips：
 // - 永远保证兜底 DROP 存在（从而实现“默认全拒绝”）
-// - 先清旧的 ACCEPT，再插入新的 ACCEPT（插链首，优先匹配）
+// - 先清旧 ACCEPT（以 iptables 实况为准，移除该端口所有 ACCEPT），再插入新的 ACCEPT（插链首，优先匹配）
 // - ips 为空 => 仅保留兜底 DROP，等价“该端口全拒绝”
 func replacePortIPs(port int, ips []string) error {
 	if err := ensureChain(); err != nil {
@@ -108,7 +143,7 @@ func replacePortIPs(port int, ips []string) error {
 		return err
 	}
 
-	// 1) 清旧 ACCEPT
+	// 1) 清旧 ACCEPT（以 iptables 实况为准，移除该端口所有 ACCEPT）
 	clearAcceptRules(port)
 
 	// 2) 空数组 => 不再添加 ACCEPT，端口保持“全拒绝”
@@ -139,6 +174,7 @@ func replacePortIPs(port int, ips []string) error {
 	// 4) 添加新的 ACCEPT（插到链首，确保优先于兜底 DROP）
 	p := strconv.Itoa(port)
 	for _, ip := range clean {
+		// 确保新规则优先匹配：插入到链首位置 1
 		// TCP
 		if err := ipt("-I", fwChain, "1", "-p", "tcp", "-s", ip, "--dport", p, "-j", "ACCEPT"); err != nil {
 			return err

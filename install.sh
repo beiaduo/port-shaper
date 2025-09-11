@@ -62,6 +62,7 @@ install_deps() {
   need_pkg ca-certificates
   need_pkg dnsutils || true
   need_pkg coreutils || true    # 提供 shuf
+  need_pkg iptables || true
 }
 
 download_binary() {
@@ -77,6 +78,46 @@ download_binary() {
   sudo install -d -m 0755 "${BIN_DIR}"
   sudo install -m 0755 "${tmp}/${BIN_NAME}" "${BIN_PATH}"
   rm -rf "$tmp"
+}
+
+# ---- 防火墙初始化/总开关（不依赖 API）----
+FW_CHAIN="PS_TRUST"
+FW_COMMENT="PS_GLOBAL_DROP"
+
+fw_ensure_chain() {
+  # 1) 创建自定义链（幂等）
+  sudo iptables -N "$FW_CHAIN" 2>/dev/null || true
+  # 2) 确保 INPUT 链跳到 PS_TRUST（置于靠前位置，避免被其它 ACCEPT 提前放过）
+  if ! sudo iptables -C INPUT -j "$FW_CHAIN" 2>/dev/null; then
+    sudo iptables -I INPUT 1 -j "$FW_CHAIN"
+  fi
+}
+
+fw_chain_lines() { sudo iptables -S "$FW_CHAIN" 2>/dev/null || true; }
+
+fw_chain_empty() {
+  local lines
+  lines="$(fw_chain_lines | grep -E "^-A " || true)"
+  [[ -z "$lines" ]]
+}
+
+fw_enable_global_drop() {
+  # 在链首插入一条带注释的全局 DROP（若不存在）
+  if ! sudo iptables -C "$FW_CHAIN" -m comment --comment "$FW_COMMENT" -j DROP 2>/dev/null; then
+    sudo iptables -I "$FW_CHAIN" 1 -m comment --comment "$FW_COMMENT" -j DROP
+  fi
+}
+
+fw_disable_global_drop() {
+  # 删除所有带注释的全局 DROP（幂等）
+  local line del
+  while read -r line; do
+    echo "$line" | grep -q -- "--comment $FW_COMMENT" || continue
+    echo "$line" | grep -q -- " -j DROP" || continue
+    # 形如：-A PS_TRUST -m comment --comment PS_GLOBAL_DROP -j DROP
+    del="$(echo "$line" | sed -e "s/^-A /-D /")"
+    sudo iptables $del 2>/dev/null || true
+  done < <(fw_chain_lines)
 }
 
 # 迁移旧 env（BASE_PATH -> SUFFIX），并生成缺失项
@@ -160,6 +201,30 @@ source "$ENV"
 get_local_ip(){ ip route get 8.8.8.8 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || echo 127.0.0.1; }
 get_public_ip(){ [[ -n "${1:-}" ]] && echo "$1" && return; command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 https://api.ipify.org || true; }
 
+FW_CHAIN="PS_TRUST"
+FW_COMMENT="PS_GLOBAL_DROP"
+
+fw_ensure_chain(){
+  sudo iptables -N "$FW_CHAIN" 2>/dev/null || true
+  if ! sudo iptables -C INPUT -j "$FW_CHAIN" 2>/dev/null; then
+    sudo iptables -I INPUT 1 -j "$FW_CHAIN"
+  fi
+}
+fw_enable_global_drop(){
+  if ! sudo iptables -C "$FW_CHAIN" -m comment --comment "$FW_COMMENT" -j DROP 2>/dev/null; then
+    sudo iptables -I "$FW_CHAIN" 1 -m comment --comment "$FW_COMMENT" -j DROP
+  fi
+}
+fw_disable_global_drop(){
+  local line del
+  while read -r line; do
+    echo "$line" | grep -q -- "--comment $FW_COMMENT" || continue
+    echo "$line" | grep -q -- " -j DROP" || continue
+    del="$(echo "$line" | sed -e 's/^-A /-D /')"
+    sudo iptables $del 2>/dev/null || true
+  done < <(sudo iptables -S "$FW_CHAIN" 2>/dev/null || true)
+}
+
 show_info(){
   local L P U
   L="$(get_local_ip)"; P="$(get_public_ip "${1:-}")"; [[ -z "$P" ]] && P="$L"
@@ -230,6 +295,8 @@ menu(){
     echo " 4) 重启服务"
     echo " 5) 修改网卡 (当前: ${DEV})"
     echo " 6) 卸载 Port-Shaper"
+    echo " 7) 开启全部 DROP（默认全拒绝）"
+    echo " 8) 取消全部 DROP"
     echo " 0) 退出"
     read -rp "请选择: " c
     case "$c" in
@@ -239,6 +306,8 @@ menu(){
       4) systemctl restart port-shaper && echo "已重启" ;;
       5) change_dev ;;
       6) do_uninstall; exit 0 ;;
+      7) fw_ensure_chain; fw_enable_global_drop; echo "✅ 已开启全部 DROP" ;;
+      8) fw_disable_global_drop; echo "✅ 已取消全部 DROP" ;;
       0) exit 0 ;;
       *) echo "无效选择" ;;
     esac
@@ -266,6 +335,13 @@ main() {
   write_service
   start_service
   write_cli
+
+  # ---- 首次安装：默认全拒绝（全部 DROP）----
+  fw_ensure_chain
+  if fw_chain_empty; then
+    fw_enable_global_drop
+    echo "[install] PS_TRUST is empty -> inserted global DROP (default deny all)."
+  fi
 
   # shellcheck disable=SC1091
   source "${ENV_FILE}"
